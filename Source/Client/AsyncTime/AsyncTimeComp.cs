@@ -153,11 +153,15 @@ namespace Multiplayer.Client
                 {
                     try
                     {
+                        // Sync both map and world random states
                         Multiplayer.game.sync.TryAddMapRandomState(map.uniqueID, randState);
+                        
+                        // CRITICAL FIX: Also sync world random state to prevent "Wrong random state for the world"
+                        Multiplayer.game.sync.TryAddWorldRandomState(Rand.StateCompressed);
                     }
                     catch (Exception syncError)
                     {
-                        MpLog.Error($"Error syncing map random state for map {map?.uniqueID}: {syncError}");
+                        MpLog.Error($"Error syncing random states for map {map?.uniqueID}: {syncError}");
                         // Don't rethrow - sync failure shouldn't crash the tick
                     }
                 }
