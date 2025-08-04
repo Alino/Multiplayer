@@ -22,27 +22,11 @@ namespace Multiplayer.Client
         {
             var comp = map.MpComp();
 
-            // ASYNC TIME DESYNC FIXES: Use improved pause coordination system
-            var pauseState = GetMapPauseState(map.uniqueID);
             var enforcePause = comp.sessionManager.IsAnySessionCurrentlyPausing(map) ||
                 Multiplayer.WorldComp.sessionManager.IsAnySessionCurrentlyPausing(map);
             
-            pauseState.SetPauseState(enforcePause);
-            
-            if (pauseState.IsPaused)
-            {
-                // Preserve random state when paused to maintain consistency
-                if (!pauseState.StatePreserved)
-                {
-                    pauseState.PreserveState(randState);
-                }
+            if (enforcePause)
                 return 0f;
-            }
-            else if (pauseState.StatePreserved)
-            {
-                // Restore random state when unpaused
-                randState = pauseState.RestoreState();
-            }
 
             if (mapTicks < slower.forceNormalSpeedUntil)
                 return speed == TimeSpeed.Paused ? 0 : 1;
@@ -98,11 +82,6 @@ namespace Multiplayer.Client
         // Shared random state for ticking and commands
         public ulong randState = 1;
 
-        // ASYNC TIME DESYNC FIXES: Enhanced state tracking for better synchronization
-        private static readonly Dictionary<int, MapPauseState> mapPauseStates = new();
-        private static readonly object mapPauseStatesLock = new object();
-        private static readonly Dictionary<int, CommandExecutionContext> executionContexts = new();
-        private static readonly object executionContextsLock = new object();
 
         public Queue<ScheduledCommand> cmds = new();
 
@@ -114,14 +93,11 @@ namespace Multiplayer.Client
         public void Tick()
         {
             tickingMap = map;
+            ulong preTickRandState = randState;
             
             try
             {
-                // ASYNC TIME DESYNC FIXES: Enhanced exception handling for stability
                 PreContext();
-
-                // Capture random state before any potentially random operations
-                var preTickRandState = randState;
 
                 //SimpleProfiler.Start();
 
@@ -147,24 +123,6 @@ namespace Multiplayer.Client
 
                 UpdateManagers();
                 CacheNothingHappening();
-                
-                // ASYNC TIME DESYNC FIXES: Only sync random state if it changed significantly
-                if (ShouldSyncRandomState(preTickRandState, randState))
-                {
-                    try
-                    {
-                        // Sync both map and world random states
-                        Multiplayer.game.sync.TryAddMapRandomState(map.uniqueID, randState);
-                        
-                        // CRITICAL FIX: Also sync world random state to prevent "Wrong random state for the world"
-                        Multiplayer.game.sync.TryAddWorldRandomState(Rand.StateCompressed);
-                    }
-                    catch (Exception syncError)
-                    {
-                        MpLog.Error($"Error syncing random states for map {map?.uniqueID}: {syncError}");
-                        // Don't rethrow - sync failure shouldn't crash the tick
-                    }
-                }
             }
             catch (Exception e)
             {
@@ -176,12 +134,26 @@ namespace Multiplayer.Client
                 try
                 {
                     PostContext();
+                    
+                    // SIMPLIFIED FIX: Only sync on significant state changes or periodically
+                    if (ShouldSyncRandomState(preTickRandState, randState))
+                    {
+                        try
+                        {
+                            // Only sync map random state - let world component handle world state
+                            Multiplayer.game.sync.TryAddMapRandomState(map.uniqueID, randState);
+                        }
+                        catch (Exception syncError)
+                        {
+                            MpLog.Error($"Error syncing random state for map {map?.uniqueID}: {syncError}");
+                        }
+                    }
+                    
                     eventCount++;
                 }
                 catch (Exception postError)
                 {
                     MpLog.Error($"Error in PostContext for map {map?.uniqueID}: {postError}");
-                    // Don't rethrow in finally block
                 }
                 finally
                 {
@@ -286,26 +258,15 @@ namespace Multiplayer.Client
 
             MpContext context = data.MpContext();
 
-            // ASYNC TIME DESYNC FIXES: Performance optimization - only create execution context if needed
-            CommandExecutionContext executionContext = null;
-            bool needsDeterministicExecution = IsCommandTypeThatNeedsRandomness(cmdType);
-            
-            if (needsDeterministicExecution)
-            {
-                executionContext = new CommandExecutionContext(cmd, map);
-                
-                lock (executionContextsLock)
-                {
-                    executionContexts[map.uniqueID] = executionContext;
-                }
-            }
-
             keepTheMap = false;
             var prevMap = Current.Game.CurrentMap;
             Current.Game.currentMapIndex = (sbyte)map.Index;
 
             executingCmdMap = map;
             TickPatch.currentExecutingCmdIssuedBySelf = cmd.issuedBySelf && !TickPatch.Simulating;
+
+            // SIMPLIFIED FIX: Capture random state before command execution
+            ulong preCommandRandState = randState;
 
             PreContext();
             map.PushFaction(cmd.GetFaction());
@@ -323,12 +284,6 @@ namespace Multiplayer.Client
 
             try
             {
-                // ASYNC TIME DESYNC FIXES: Enter deterministic execution mode only if needed
-                if (needsDeterministicExecution)
-                {
-                    executionContext.EnterDeterministicMode();
-                }
-                
                 if (cmdType == CommandType.Sync)
                 {
                     var handler = SyncUtil.HandleCmd(data);
@@ -384,35 +339,24 @@ namespace Multiplayer.Client
 
                 keepTheMap = false;
 
-                // ASYNC TIME DESYNC FIXES: Exit deterministic mode and only sync if command used randomness
-                if (needsDeterministicExecution && executionContext != null)
+                // SIMPLIFIED FIX: Only sync random state if it actually changed during command
+                if (preCommandRandState != randState)
                 {
-                    executionContext.ExitDeterministicMode();
-                    
-                    if (executionContext.RandomnessWasUsed)
+                    try
                     {
+                        Multiplayer.game.sync.TryAddMapRandomState(map.uniqueID, randState);
                         Multiplayer.game.sync.TryAddCommandRandomState(randState);
                     }
-                }
-                else
-                {
-                    // For commands that don't need deterministic execution, sync as before
-                    Multiplayer.game.sync.TryAddCommandRandomState(randState);
+                    catch (Exception syncError)
+                    {
+                        MpLog.Error($"Error syncing command random state: {syncError}");
+                    }
                 }
 
                 eventCount++;
 
                 if (cmdType != CommandType.MapTimeSpeed)
                     Multiplayer.ReaderLog.AddCurrentNode(data);
-                    
-                // ASYNC TIME DESYNC FIXES: Cleanup execution context
-                if (needsDeterministicExecution)
-                {
-                    lock (executionContextsLock)
-                    {
-                        executionContexts.Remove(map.uniqueID);
-                    }
-                }
             }
         }
 
@@ -534,260 +478,18 @@ namespace Multiplayer.Client
             MultiplayerAsyncQuest.TickMapQuests(this);
         }
 
-        // ASYNC TIME DESYNC FIXES: Helper methods for improved synchronization
-
         /// <summary>
         /// Determines if random state changes are significant enough to sync
-        /// CONSERVATIVE: Always sync any change to maintain correctness
         /// </summary>
         private bool ShouldSyncRandomState(ulong preState, ulong postState)
         {
-            // SAFETY FIRST: Always sync if state changed at all
-            // The original issue was timing noise, not excessive syncing
-            if (preState != postState)
-                return true;
-                
-            // Also sync at regular intervals even if no change (for heartbeat)
-            if (TickPatch.Timer % 60 == 0)
-                return true;
-                
+            // Sync if the random state actually changed during this tick
+            if (preState != postState) return true;
+            
+            // Also sync periodically (every second) to prevent any drift
+            if (mapTicks % 60 == 0) return true;
+            
             return false;
-        }
-
-        /// <summary>
-        /// SAFE: Conservative approach to command randomness classification
-        /// Better safe than sorry - unknown commands get deterministic execution
-        /// </summary>
-        private static bool IsCommandTypeThatNeedsRandomness(CommandType cmdType)
-        {
-            // SAFE: Default to true for unknown command types to prevent desyncs
-            return cmdType switch
-            {
-                CommandType.Sync => true,        // Sync commands can trigger random events
-                CommandType.Designator => true,  // Designators (building, etc.) often use randomness
-                CommandType.DebugTools => true,  // Debug tools might use randomness
-                
-                // Only explicitly exclude commands we KNOW are safe
-                CommandType.MapTimeSpeed => false, // Time speed changes are deterministic
-                
-                // SAFE: Unknown commands default to deterministic execution
-                // Better performance hit than desync risk
-                _ => true 
-            };
-        }
-
-        /// <summary>
-        /// Get or create thread-safe pause state for a map
-        /// </summary>
-        private static MapPauseState GetMapPauseState(int mapId)
-        {
-            // SAFE: Always use proper locking - performance is less important than correctness
-            lock (mapPauseStatesLock)
-            {
-                if (mapPauseStates.TryGetValue(mapId, out var existingState))
-                {
-                    return existingState;
-                }
-                
-                // Create new state within lock
-                var newState = new MapPauseState();
-                mapPauseStates[mapId] = newState;
-                
-                return newState;
-            }
-        }
-
-        /// <summary>
-        /// Clean up map-specific state to prevent memory leaks when maps are destroyed
-        /// </summary>
-        public static void CleanupMapState(int mapId)
-        {
-            lock (mapPauseStatesLock)
-            {
-                if (mapPauseStates.Remove(mapId))
-                {
-                    MpLog.Debug($"Cleaned up pause state for map {mapId}");
-                }
-            }
-        }
-
-        /// <summary>
-        /// Clean up execution context for destroyed maps
-        /// </summary>
-        public static void CleanupExecutionContext(int mapId)
-        {
-            lock (executionContextsLock)
-            {
-                if (executionContexts.Remove(mapId))
-                {
-                    MpLog.Debug($"Cleaned up execution context for map {mapId}");
-                }
-            }
-        }
-
-        /// <summary>
-        /// Clean up all async time state (called when game ends)
-        /// </summary>
-        public static void CleanupAllState()
-        {
-            lock (mapPauseStatesLock)
-            {
-                int count = mapPauseStates.Count;
-                mapPauseStates.Clear();
-                if (count > 0)
-                {
-                    MpLog.Debug($"Cleaned up {count} map pause states");
-                }
-            }
-
-            lock (executionContextsLock)
-            {
-                int count = executionContexts.Count;
-                executionContexts.Clear();
-                if (count > 0)
-                {
-                    MpLog.Debug($"Cleaned up {count} execution contexts");
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// Context for deterministic command execution
-    /// </summary>
-    public class CommandExecutionContext
-    {
-        public ScheduledCommand Command { get; }
-        public Map Map { get; }
-        public bool RandomnessWasUsed { get; private set; }
-        
-        private ulong preExecutionRandState;
-        private int randomCallCount;
-        private bool randomStatePushed = false; // Track if we successfully pushed state
-
-        public CommandExecutionContext(ScheduledCommand command, Map map)
-        {
-            Command = command;
-            Map = map;
-        }
-
-        public void EnterDeterministicMode()
-        {
-            preExecutionRandState = Rand.StateCompressed;
-            randomCallCount = 0;
-            randomStatePushed = false;
-            
-            // Set deterministic seed based on command properties
-            var commandSeed = GenerateCommandSeed();
-            
-            try
-            {
-                Rand.PushState();
-                randomStatePushed = true; // Only set if push succeeded
-                Rand.Seed = commandSeed;
-            }
-            catch (Exception e)
-            {
-                MpLog.Error($"Failed to enter deterministic mode: {e}");
-                randomStatePushed = false;
-                // Critical: Don't continue execution with wrong random state
-                throw;
-            }
-        }
-
-        public void ExitDeterministicMode()
-        {
-            try
-            {
-                var postExecutionRandState = Rand.StateCompressed;
-                RandomnessWasUsed = postExecutionRandState != preExecutionRandState || randomCallCount > 0;
-                
-                // Only pop if we successfully pushed
-                if (randomStatePushed)
-                {
-                    Rand.PopState();
-                    randomStatePushed = false;
-                }
-            }
-            catch (Exception e)
-            {
-                MpLog.Error($"CRITICAL: Failed to exit deterministic mode: {e}");
-                
-                // Last resort: Reset to pre-execution state to prevent permanent corruption
-                if (randomStatePushed)
-                {
-                    try
-                    {
-                        Rand.StateCompressed = preExecutionRandState;
-                        randomStatePushed = false;
-                        MpLog.Error("Random state reset to pre-execution value as emergency recovery");
-                    }
-                    catch (Exception resetError)
-                    {
-                        MpLog.Error($"CATASTROPHIC: Cannot recover random state: {resetError}");
-                        // At this point, the random state is permanently corrupted
-                        // This would require a full game restart to fix
-                    }
-                }
-            }
-        }
-
-        private int GenerateCommandSeed()
-        {
-            // Generate DETERMINISTIC seed from command content to ensure
-            // the SAME command produces the SAME random sequence across ALL clients
-            // CRITICAL: Must not include any client-specific data like thread IDs!
-            return Gen.HashCombineInt(
-                Command.ticks,
-                Command.type.GetHashCode(),
-                Command.data?.GetHashCode() ?? 0,
-                Gen.HashCombineInt(Map.uniqueID, Command.playerId)
-                // NEVER add thread IDs, timestamps, or other client-specific data!
-            );
-        }
-    }
-
-    /// <summary>
-    /// State tracking for map pause coordination - Thread Safe
-    /// </summary>
-    public class MapPauseState
-    {
-        private volatile bool _isPaused;
-        private volatile bool _statePreserved;
-        private ulong _preservedRandState;
-        private readonly object _lock = new object();
-
-        public bool IsPaused 
-        { 
-            get => _isPaused;
-        }
-        
-        public bool StatePreserved => _statePreserved;
-
-        /// <summary>
-        /// Thread-safe setter for pause state
-        /// </summary>
-        public void SetPauseState(bool isPaused)
-        {
-            _isPaused = isPaused;
-        }
-
-        public void PreserveState(ulong randState)
-        {
-            lock (_lock)
-            {
-                _preservedRandState = randState;
-                _statePreserved = true;
-            }
-        }
-
-        public ulong RestoreState()
-        {
-            lock (_lock)
-            {
-                _statePreserved = false;
-                return _preservedRandState;
-            }
         }
     }
 

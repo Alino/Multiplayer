@@ -97,6 +97,8 @@ public class AsyncWorldTimeComp : IExposable, ITickable
     public void Tick()
     {
         tickingWorld = true;
+        ulong preTickRandState = randState;
+        
         PreContext();
 
         try
@@ -131,7 +133,18 @@ public class AsyncWorldTimeComp : IExposable, ITickable
             PostContext();
             tickingWorld = false;
 
-            Multiplayer.game.sync.TryAddWorldRandomState(randState);
+            // SYNC FIX: Only sync when world random state actually changes or periodically
+            if (ShouldSyncWorldRandomState(preTickRandState, randState))
+            {
+                try
+                {
+                    Multiplayer.game.sync.TryAddWorldRandomState(randState);
+                }
+                catch (Exception syncError)
+                {
+                    MpLog.Error($"Error syncing world random state: {syncError}");
+                }
+            }
         }
     }
 
@@ -170,6 +183,9 @@ public class AsyncWorldTimeComp : IExposable, ITickable
 
         executingCmdWorld = true;
         TickPatch.currentExecutingCmdIssuedBySelf = cmd.issuedBySelf && !TickPatch.Simulating;
+
+        // SYNC FIX: Capture random state before command execution
+        ulong preCommandRandState = randState;
 
         PreContext();
         FactionExtensions.PushFaction(null, cmd.GetFaction());
@@ -237,7 +253,18 @@ public class AsyncWorldTimeComp : IExposable, ITickable
             TickPatch.currentExecutingCmdIssuedBySelf = false;
             executingCmdWorld = false;
 
-            Multiplayer.game.sync.TryAddCommandRandomState(randState);
+            // SYNC FIX: Only sync random state if it actually changed during command
+            if (preCommandRandState != randState)
+            {
+                try
+                {
+                    Multiplayer.game.sync.TryAddCommandRandomState(randState);
+                }
+                catch (Exception syncError)
+                {
+                    MpLog.Error($"Error syncing world command random state: {syncError}");
+                }
+            }
 
             if (cmdType != CommandType.GlobalTimeSpeed)
                 Multiplayer.ReaderLog.AddCurrentNode(data);
@@ -299,5 +326,28 @@ public class AsyncWorldTimeComp : IExposable, ITickable
     public void FinalizeInit()
     {
         Multiplayer.game.SetThingMakerSeed((int)(randState >> 32));
+    }
+
+    /// <summary>
+    /// Determines if world random state changes are significant enough to sync
+    /// </summary>
+    private bool ShouldSyncWorldRandomState(ulong preState, ulong postState)
+    {
+        // Sync if the random state actually changed during this tick
+        if (preState != postState) return true;
+        
+        // TEMPORARY: Sync more frequently during early game to debug desync
+        // Sync every 10 ticks for the first 100 ticks, then every 60 ticks
+        if (worldTicks < 100)
+        {
+            if (worldTicks % 10 == 0) return true;
+        }
+        else
+        {
+            // Also sync periodically (every second) to prevent any drift
+            if (worldTicks % 60 == 0) return true;
+        }
+        
+        return false;
     }
 }
