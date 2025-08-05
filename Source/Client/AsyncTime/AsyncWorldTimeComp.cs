@@ -133,7 +133,7 @@ public class AsyncWorldTimeComp : IExposable, ITickable
             PostContext();
             tickingWorld = false;
 
-            // SYNC FIX: Only sync when world random state actually changes or periodically
+            // Sync world random state when it changes or periodically to prevent drift
             if (ShouldSyncWorldRandomState(preTickRandState, randState))
             {
                 try
@@ -184,7 +184,7 @@ public class AsyncWorldTimeComp : IExposable, ITickable
         executingCmdWorld = true;
         TickPatch.currentExecutingCmdIssuedBySelf = cmd.issuedBySelf && !TickPatch.Simulating;
 
-        // SYNC FIX: Capture random state before command execution
+        // Capture random state before command execution to detect changes
         ulong preCommandRandState = randState;
 
         PreContext();
@@ -253,7 +253,7 @@ public class AsyncWorldTimeComp : IExposable, ITickable
             TickPatch.currentExecutingCmdIssuedBySelf = false;
             executingCmdWorld = false;
 
-            // SYNC FIX: Only sync random state if it actually changed during command
+            // Sync random state only if command execution modified it
             if (preCommandRandState != randState)
             {
                 try
@@ -336,15 +336,15 @@ public class AsyncWorldTimeComp : IExposable, ITickable
         // Sync if the random state actually changed during this tick
         if (preState != postState) return true;
         
-        // TEMPORARY: Sync more frequently during early game to debug desync
-        // Sync every 10 ticks for the first 100 ticks, then every 60 ticks
+        // Sync more frequently during early game when desyncs are most likely
+        // Every 10 ticks for first 100 ticks, then every 60 ticks
         if (worldTicks < 100)
         {
             if (worldTicks % 10 == 0) return true;
         }
         else
         {
-            // Also sync periodically (every second) to prevent any drift
+            // Periodic sync to prevent any accumulated drift
             if (worldTicks % 60 == 0) return true;
         }
         

@@ -135,7 +135,7 @@ namespace Multiplayer.Client
                 {
                     PostContext();
                     
-                    // SIMPLIFIED FIX: Only sync on significant state changes or periodically
+                    // Sync random state when it changes or periodically to prevent drift
                     if (ShouldSyncRandomState(preTickRandState, randState))
                     {
                         try
@@ -265,7 +265,7 @@ namespace Multiplayer.Client
             executingCmdMap = map;
             TickPatch.currentExecutingCmdIssuedBySelf = cmd.issuedBySelf && !TickPatch.Simulating;
 
-            // SIMPLIFIED FIX: Capture random state before command execution
+            // Capture random state before command execution to detect changes
             ulong preCommandRandState = randState;
 
             PreContext();
@@ -339,7 +339,7 @@ namespace Multiplayer.Client
 
                 keepTheMap = false;
 
-                // SIMPLIFIED FIX: Only sync random state if it actually changed during command
+                // Sync random state only if command execution modified it
                 if (preCommandRandState != randState)
                 {
                     try
@@ -486,7 +486,7 @@ namespace Multiplayer.Client
             // Sync if the random state actually changed during this tick
             if (preState != postState) return true;
             
-            // Also sync periodically (every second) to prevent any drift
+            // Periodic sync to prevent accumulated drift
             if (mapTicks % 60 == 0) return true;
             
             return false;
