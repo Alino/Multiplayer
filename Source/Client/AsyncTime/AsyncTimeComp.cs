@@ -24,7 +24,7 @@ namespace Multiplayer.Client
 
             var enforcePause = comp.sessionManager.IsAnySessionCurrentlyPausing(map) ||
                 Multiplayer.WorldComp.sessionManager.IsAnySessionCurrentlyPausing(map);
-
+            
             if (enforcePause)
                 return 0f;
 
@@ -82,6 +82,7 @@ namespace Multiplayer.Client
         // Shared random state for ticking and commands
         public ulong randState = 1;
 
+
         public Queue<ScheduledCommand> cmds = new();
 
         public AsyncTimeComp(Map map)
@@ -92,12 +93,14 @@ namespace Multiplayer.Client
         public void Tick()
         {
             tickingMap = map;
-            PreContext();
-
-            //SimpleProfiler.Start();
-
+            ulong preTickRandState = randState;
+            
             try
             {
+                PreContext();
+
+                //SimpleProfiler.Start();
+
                 map.MapPreTick();
                 mapTicks++;
                 Find.TickManager.ticksGameInt = mapTicks;
@@ -121,14 +124,42 @@ namespace Multiplayer.Client
                 UpdateManagers();
                 CacheNothingHappening();
             }
+            catch (Exception e)
+            {
+                MpLog.Error($"Critical error in AsyncTimeComp tick for map {map?.uniqueID}: {e}");
+                throw;
+            }
             finally
             {
-                PostContext();
-                Multiplayer.game.sync.TryAddMapRandomState(map.uniqueID, randState);
-                eventCount++;
-                tickingMap = null;
-
-                //SimpleProfiler.Pause();
+                try
+                {
+                    PostContext();
+                    
+                    // SIMPLIFIED FIX: Only sync on significant state changes or periodically
+                    if (ShouldSyncRandomState(preTickRandState, randState))
+                    {
+                        try
+                        {
+                            // Only sync map random state - let world component handle world state
+                            Multiplayer.game.sync.TryAddMapRandomState(map.uniqueID, randState);
+                        }
+                        catch (Exception syncError)
+                        {
+                            MpLog.Error($"Error syncing random state for map {map?.uniqueID}: {syncError}");
+                        }
+                    }
+                    
+                    eventCount++;
+                }
+                catch (Exception postError)
+                {
+                    MpLog.Error($"Error in PostContext for map {map?.uniqueID}: {postError}");
+                }
+                finally
+                {
+                    tickingMap = null;
+                    //SimpleProfiler.Pause();
+                }
             }
         }
 
@@ -234,6 +265,9 @@ namespace Multiplayer.Client
             executingCmdMap = map;
             TickPatch.currentExecutingCmdIssuedBySelf = cmd.issuedBySelf && !TickPatch.Simulating;
 
+            // SIMPLIFIED FIX: Capture random state before command execution
+            ulong preCommandRandState = randState;
+
             PreContext();
             map.PushFaction(cmd.GetFaction());
 
@@ -305,7 +339,19 @@ namespace Multiplayer.Client
 
                 keepTheMap = false;
 
-                Multiplayer.game.sync.TryAddCommandRandomState(randState);
+                // SIMPLIFIED FIX: Only sync random state if it actually changed during command
+                if (preCommandRandState != randState)
+                {
+                    try
+                    {
+                        Multiplayer.game.sync.TryAddMapRandomState(map.uniqueID, randState);
+                        Multiplayer.game.sync.TryAddCommandRandomState(randState);
+                    }
+                    catch (Exception syncError)
+                    {
+                        MpLog.Error($"Error syncing command random state: {syncError}");
+                    }
+                }
 
                 eventCount++;
 
@@ -430,6 +476,20 @@ namespace Multiplayer.Client
             if (!Multiplayer.GameComp.asyncTime || Paused) return;
 
             MultiplayerAsyncQuest.TickMapQuests(this);
+        }
+
+        /// <summary>
+        /// Determines if random state changes are significant enough to sync
+        /// </summary>
+        private bool ShouldSyncRandomState(ulong preState, ulong postState)
+        {
+            // Sync if the random state actually changed during this tick
+            if (preState != postState) return true;
+            
+            // Also sync periodically (every second) to prevent any drift
+            if (mapTicks % 60 == 0) return true;
+            
+            return false;
         }
     }
 
